@@ -52,6 +52,7 @@ current_qid = None
 round_deadline = 0.0
 answers = {}  # client_id -> (choice, recv_time)
 start_event = threading.Event()
+shutdown_event = threading.Event()
 
 def send_json(conn, message):
     data = json.dumps(message).encode() + b"\n"
@@ -67,7 +68,7 @@ def broadcast(message):
         except OSError:
             remove_client(conn)
     if msg_type:
-        log(f"Broadcast -> {msg_type}")
+        log(f"Broadcast -> {msg_type} (clients={len(conns)})")
 
 def scoreboard_snapshot():
     with state_lock:
@@ -82,13 +83,21 @@ def remove_client(conn):
     name = clients.get(conn, {}).get("name", "unknown")
     with state_lock:
         clients.pop(conn, None)
+        remaining = len(clients)
     try:
         conn.close()
     except OSError:
         pass
-    log(f"Disconnected: {name}")
+    log(f"Disconnected: {name} (remaining={remaining})")
     broadcast({"type": "scoreboard", "scoreboard": scoreboard_snapshot()})
     broadcast({"type": "players", "count": len(clients)})
+    if remaining == 0:
+        log("No players left, shutting down server")
+        shutdown_event.set()
+        try:
+            server.close()
+        except OSError:
+            pass
 
 def start_game():
     global game_active, current_qid, round_deadline, answers
@@ -107,6 +116,8 @@ def game_loop():
     global game_active, current_qid, round_deadline, answers
     while True:
         start_event.wait()
+        if shutdown_event.is_set():
+            return
 
         try:
             questions = gauti_klausimus_be_pasikartojimu(TOTAL_QUESTIONS)
@@ -264,7 +275,7 @@ def handle_client(conn, addr):
                         clients[conn] = {"id": next_client_id, "name": name, "score": 0}
                         next_client_id += 1
                     send_json(conn, {"type": "join_ok"})
-                    log(f"Join ok: {name}")
+                    log(f"Join ok: {name} (total={len(clients)})")
                     broadcast({"type": "players", "count": len(clients)})
                     broadcast({"type": "scoreboard", "scoreboard": scoreboard_snapshot()})
 
@@ -311,7 +322,7 @@ def handle_client(conn, addr):
                         if client_id not in answers:
                             answers[client_id] = (choice, now)
                     send_json(conn, {"type": "answer_ack", "ok": True})
-                    log(f"Answer ack ok: choice={choice}")
+                    log(f"Answer ack ok: choice={choice} clientId={client_id}")
 
                 elif msg_type == "exit":
                     send_json(conn, {"type": "bye"})
@@ -325,6 +336,14 @@ def handle_client(conn, addr):
 
 threading.Thread(target=game_loop, daemon=True).start()
 
-while True:
-    conn, addr = server.accept()
+server.settimeout(1.0)
+while not shutdown_event.is_set():
+    try:
+        conn, addr = server.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
     threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+
+log("Server stopped")
