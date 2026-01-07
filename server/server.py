@@ -11,7 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from game.questions import gauti_atsitiktini_klausima, klausimas_i_payload, ar_teisingas
 
-HOST = "0.0.0.0"
+HOST = "192.168.4.1"
 PORT = 7777
 MAX_NUM_OF_CLIENTS = 10
 ANSWER_WINDOW_S = 30

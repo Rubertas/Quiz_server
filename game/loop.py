@@ -1,6 +1,6 @@
 import time
 from questions import gauti_atsitiktini_klausima, klausimas_i_payload, ar_teisingas
-from Quiz_server.game.state import GameState
+from game.state import GameState
 from game import protocol as P
 
 def start_game_loop(
