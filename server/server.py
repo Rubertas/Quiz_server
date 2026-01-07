@@ -9,7 +9,7 @@ import time
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-from game.questions import gauti_atsitiktini_klausima, klausimas_i_payload, ar_teisingas
+from game.questions import gauti_klausimus_be_pasikartojimu, klausimas_i_payload, ar_teisingas
 
 HOST = "192.168.4.1"
 PORT = 7777
@@ -25,6 +25,10 @@ server.listen()
 
 local_ip = socket.gethostbyname(socket.gethostname())
 
+def log(message):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {message}", flush=True)
+
 def get_wifi_name():
     try:
         output = subprocess.check_output(
@@ -36,9 +40,9 @@ def get_wifi_name():
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
-print(f"Prisijunk Per: {get_wifi_name()}")
-print(f"Local IP: {local_ip}")
-print(f"PORT: {PORT}")
+log(f"Prisijunk Per: {get_wifi_name()}")
+log(f"Local IP: {local_ip}")
+log(f"PORT: {PORT}")
 
 state_lock = threading.Lock()
 clients = {}  # conn -> {"id": int, "name": str, "score": int}
@@ -54,11 +58,16 @@ def send_json(conn, message):
     conn.sendall(data)
 
 def broadcast(message):
-    for conn in list(clients.keys()):
+    with state_lock:
+        conns = list(clients.keys())
+    msg_type = message.get("type") if isinstance(message, dict) else None
+    for conn in conns:
         try:
             send_json(conn, message)
         except OSError:
             remove_client(conn)
+    if msg_type:
+        log(f"Broadcast -> {msg_type}")
 
 def scoreboard_snapshot():
     with state_lock:
@@ -70,12 +79,14 @@ def scoreboard_snapshot():
     return items
 
 def remove_client(conn):
+    name = clients.get(conn, {}).get("name", "unknown")
     with state_lock:
         clients.pop(conn, None)
     try:
         conn.close()
     except OSError:
         pass
+    log(f"Disconnected: {name}")
     broadcast({"type": "scoreboard", "scoreboard": scoreboard_snapshot()})
     broadcast({"type": "players", "count": len(clients)})
 
@@ -89,6 +100,7 @@ def start_game():
         round_deadline = 0.0
         game_active = True
     broadcast({"type": "scoreboard", "scoreboard": scoreboard_snapshot()})
+    log("Game started")
     start_event.set()
 
 def game_loop():
@@ -96,12 +108,22 @@ def game_loop():
     while True:
         start_event.wait()
 
-        for round_idx in range(TOTAL_QUESTIONS):
+        try:
+            questions = gauti_klausimus_be_pasikartojimu(TOTAL_QUESTIONS)
+        except ValueError as exc:
+            log(f"Game aborted: {exc}")
+            with state_lock:
+                game_active = False
+                current_qid = None
+                round_deadline = 0.0
+                answers = {}
+            start_event.clear()
+            continue
+        for round_idx, q in enumerate(questions):
             with state_lock:
                 if not game_active:
                     break
 
-            q = gauti_atsitiktini_klausima()
             qid = q["klausimo_id"]
             deadline = time.time() + ANSWER_WINDOW_S
 
@@ -119,6 +141,7 @@ def game_loop():
             payload["totalRounds"] = TOTAL_QUESTIONS
             payload["type"] = "question"
             broadcast(payload)
+            log(f"Question sent: id={qid} round={round_idx + 1}/{len(questions)}")
 
             while time.time() < deadline:
                 time.sleep(0.05)
@@ -173,13 +196,14 @@ def game_loop():
                     "type": "round_end",
                     "questionId": qid,
                     "round": round_idx + 1,
-                    "totalRounds": TOTAL_QUESTIONS,
+                    "totalRounds": len(questions),
                     "results": results,
                     "scoreboard": scoreboard_snapshot(),
                 }
             )
+            log(f"Round ended: id={qid} round={round_idx + 1}/{len(questions)}")
 
-            if round_idx < TOTAL_QUESTIONS - 1:
+            if round_idx < len(questions) - 1:
                 broadcast({"type": "next_in", "delayMs": NEXT_DELAY_S * 1000})
                 time.sleep(NEXT_DELAY_S)
 
@@ -194,6 +218,7 @@ def game_loop():
                 "scoreboard": scoreboard,
             }
         )
+        log(f"Game over: winner={winner.get('name', '')} points={winner.get('points', 0)}")
 
         with state_lock:
             game_active = False
@@ -203,6 +228,7 @@ def game_loop():
         start_event.clear()
 
 def handle_client(conn, addr):
+    log(f"Client connected: {addr}")
     buffer = b""
     while True:
         try:
@@ -217,7 +243,9 @@ def handle_client(conn, addr):
                 try:
                     msg_json = json.loads(line.decode())
                 except json.JSONDecodeError:
+                    log("Invalid JSON from client")
                     continue
+                log(f"Received -> {msg_json}")
 
                 msg_type = msg_json.get("type")
                 var = msg_json.get("variable")
@@ -229,9 +257,14 @@ def handle_client(conn, addr):
                         continue
                     global next_client_id
                     with state_lock:
+                        if len(clients) >= MAX_NUM_OF_CLIENTS:
+                            send_json(conn, {"type": "error", "message": "server_full"})
+                            log("Join rejected: server_full")
+                            continue
                         clients[conn] = {"id": next_client_id, "name": name, "score": 0}
                         next_client_id += 1
                     send_json(conn, {"type": "join_ok"})
+                    log(f"Join ok: {name}")
                     broadcast({"type": "players", "count": len(clients)})
                     broadcast({"type": "scoreboard", "scoreboard": scoreboard_snapshot()})
 
@@ -240,10 +273,15 @@ def handle_client(conn, addr):
                         if game_active:
                             send_json(conn, {"type": "error", "message": "game_already_active"})
                             continue
+                        if len(clients) == 0:
+                            send_json(conn, {"type": "error", "message": "no_players"})
+                            continue
                     start_game()
                     send_json(conn, {"type": "start_ok"})
+                    log("Start ok sent")
 
                 elif msg_type == "answer":
+                    qid = msg_json.get("questionId")
                     choice = msg_json.get("choice") or var
                     if choice is None:
                         send_json(conn, {"type": "error", "message": "answer_missing"})
@@ -260,6 +298,9 @@ def handle_client(conn, addr):
                         if current_qid is None:
                             send_json(conn, {"type": "answer_ack", "ok": False, "reason": "no_question"})
                             continue
+                        if qid is not None and int(qid) != current_qid:
+                            send_json(conn, {"type": "answer_ack", "ok": False, "reason": "not_current_question"})
+                            continue
                         if now > round_deadline:
                             send_json(conn, {"type": "answer_ack", "ok": False, "reason": "too_late"})
                             continue
@@ -270,9 +311,11 @@ def handle_client(conn, addr):
                         if client_id not in answers:
                             answers[client_id] = (choice, now)
                     send_json(conn, {"type": "answer_ack", "ok": True})
+                    log(f"Answer ack ok: choice={choice}")
 
                 elif msg_type == "exit":
                     send_json(conn, {"type": "bye"})
+                    log("Client exit")
                     return
 
         except ConnectionResetError:
