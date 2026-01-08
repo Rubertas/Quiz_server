@@ -54,10 +54,13 @@ log(f"Local IP: {local_ip}")
 log(f"PORT: {PORT}")
 
 state_lock = threading.Lock()
-clients = {}  # conn -> {"id": int, "name": str, "score": int}
+clients = {}  # conn -> {"id": int, "name": str, "score": int, "joined_at": float}
 next_client_id = 1
 game_active = False
 current_qid = None
+current_question = None
+current_round = 0
+total_rounds = 0
 round_deadline = 0.0
 answers = {}  # client_id -> (choice, recv_time)
 start_event = threading.Event()
@@ -103,12 +106,15 @@ def remove_client(conn):
         log("No players left, server idle", level="NET")
 
 def start_game():
-    global game_active, current_qid, round_deadline, answers
+    global game_active, current_qid, current_question, current_round, total_rounds, round_deadline, answers
     with state_lock:
         for info in clients.values():
             info["score"] = 0
         answers = {}
         current_qid = None
+        current_question = None
+        current_round = 0
+        total_rounds = 0
         round_deadline = 0.0
         game_active = True
     broadcast({"type": "scoreboard", "scoreboard": scoreboard_snapshot()})
@@ -116,7 +122,7 @@ def start_game():
     start_event.set()
 
 def game_loop():
-    global game_active, current_qid, round_deadline, answers
+    global game_active, current_qid, current_question, current_round, total_rounds, round_deadline, answers
     while True:
         start_event.wait()
 
@@ -138,12 +144,15 @@ def game_loop():
             start_event.clear()
             continue
         game_cancelled = False
+        total_rounds = len(questions)
         for round_idx, q in enumerate(questions):
             with state_lock:
                 if len(clients) == 0:
                     game_cancelled = True
                     game_active = False
                     current_qid = None
+                    current_question = None
+                    current_round = 0
                     round_deadline = 0.0
                     answers = {}
                     log("No players left during game, cancelling", level="GAME")
@@ -156,6 +165,8 @@ def game_loop():
 
             with state_lock:
                 current_qid = qid
+                current_question = q
+                current_round = round_idx + 1
                 round_deadline = deadline
                 answers = {}
 
@@ -165,7 +176,7 @@ def game_loop():
                 deadline_ms=int(deadline * 1000),
             )
             payload["round"] = round_idx + 1
-            payload["totalRounds"] = TOTAL_QUESTIONS
+            payload["totalRounds"] = total_rounds
             payload["type"] = "question"
             broadcast(payload)
             log(
@@ -214,20 +225,37 @@ def game_loop():
                             result["reason"] = "wrong"
                         results.append(result)
                     else:
-                        results.append(
-                            {
-                                "clientId": client_id,
-                                "name": name,
-                                "ok": False,
-                                "reason": "dnf",
-                                "points": -10,
-                                "point": False,
-                            }
-                        )
+                        joined_at = None
                         for info in clients.values():
                             if info["id"] == client_id:
-                                info["score"] -= 10
+                                joined_at = info.get("joined_at")
                                 break
+                        if joined_at is not None and joined_at > question_start:
+                            results.append(
+                                {
+                                    "clientId": client_id,
+                                    "name": name,
+                                    "ok": False,
+                                    "reason": "joined_late",
+                                    "points": 0,
+                                    "point": False,
+                                }
+                            )
+                        else:
+                            results.append(
+                                {
+                                    "clientId": client_id,
+                                    "name": name,
+                                    "ok": False,
+                                    "reason": "dnf",
+                                    "points": -10,
+                                    "point": False,
+                                }
+                            )
+                            for info in clients.values():
+                                if info["id"] == client_id:
+                                    info["score"] -= 10
+                                    break
 
             broadcast(
                 {
@@ -273,6 +301,9 @@ def game_loop():
         with state_lock:
             game_active = False
             current_qid = None
+            current_question = None
+            current_round = 0
+            total_rounds = 0
             round_deadline = 0.0
             answers = {}
         start_event.clear()
@@ -311,12 +342,30 @@ def handle_client(conn, addr):
                             send_json(conn, {"type": "error", "message": "server_full"})
                             log("Join rejected: server_full", level="NET")
                             continue
-                        clients[conn] = {"id": next_client_id, "name": name, "score": 0}
+                        clients[conn] = {
+                            "id": next_client_id,
+                            "name": name,
+                            "score": 0,
+                            "joined_at": time.time(),
+                        }
                         next_client_id += 1
                     send_json(conn, {"type": "join_ok"})
                     log(f"Join ok: {name} (total={len(clients)})", level="NET")
                     broadcast({"type": "players", "count": len(clients)})
                     broadcast({"type": "scoreboard", "scoreboard": scoreboard_snapshot()})
+                    with state_lock:
+                        if game_active and current_question and time.time() < round_deadline:
+                            remaining_ms = max(0, int((round_deadline - time.time()) * 1000))
+                            payload = klausimas_i_payload(
+                                current_question,
+                                duration_ms=remaining_ms,
+                                deadline_ms=int(round_deadline * 1000),
+                            )
+                            payload["round"] = current_round
+                            payload["totalRounds"] = total_rounds
+                            payload["type"] = "question"
+                            send_json(conn, payload)
+                            log(f"Sent current question to late joiner: {name}", level="GAME")
 
                 elif msg_type == "start":
                     with state_lock:

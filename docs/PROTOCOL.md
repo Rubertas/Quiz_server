@@ -46,6 +46,8 @@ Server -> Client
     ],
     "scoreboard":[{"clientId":1,"name":"Vardas","points":2}]
   }
+  results.reason: "wrong" | "dnf" | "joined_late"
+  DNF gives -10 points, joined_late gives 0 points
 - next_in
   {"type":"next_in","delayMs":10000}
 - game_over
