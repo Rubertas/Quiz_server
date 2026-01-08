@@ -120,6 +120,12 @@ def game_loop():
     while True:
         start_event.wait()
 
+        with state_lock:
+            if len(clients) == 0:
+                log("Start requested but no players, server idle", level="GAME")
+                start_event.clear()
+                continue
+
         try:
             questions = gauti_klausimus_be_pasikartojimu(TOTAL_QUESTIONS)
         except ValueError as exc:
@@ -131,8 +137,17 @@ def game_loop():
                 answers = {}
             start_event.clear()
             continue
+        game_cancelled = False
         for round_idx, q in enumerate(questions):
             with state_lock:
+                if len(clients) == 0:
+                    game_cancelled = True
+                    game_active = False
+                    current_qid = None
+                    round_deadline = 0.0
+                    answers = {}
+                    log("No players left during game, cancelling", level="GAME")
+                    break
                 if not game_active:
                     break
 
@@ -232,27 +247,28 @@ def game_loop():
                 broadcast({"type": "next_in", "delayMs": NEXT_DELAY_S * 1000})
                 time.sleep(NEXT_DELAY_S)
 
-        scoreboard = scoreboard_snapshot()
-        winner = scoreboard[0] if scoreboard else {"name": "", "points": 0, "clientId": None}
-        second = scoreboard[1] if len(scoreboard) > 1 else {"name": "", "points": 0, "clientId": None}
-        third = scoreboard[2] if len(scoreboard) > 2 else {"name": "", "points": 0, "clientId": None}
-        broadcast(
-            {
-                "type": "game_over",
-                "winnerId": winner.get("clientId"),
-                "winnerName": winner.get("name", ""),
-                "winnerPoints": winner.get("points", 0),
-                "secondId": second.get("clientId"),
-                "secondName": second.get("name", ""),
-                "secondPoints": second.get("points", 0),
-                "thirdId": third.get("clientId"),
-                "thirdName": third.get("name", ""),
-                "thirdPoints": third.get("points", 0),
-                "scoreboard": scoreboard,
-            }
-        )
-        log(f"Game over: winner={winner.get('name', '')} points={winner.get('points', 0)}", level="GAME")
-        log_blank()
+        if not game_cancelled:
+            scoreboard = scoreboard_snapshot()
+            winner = scoreboard[0] if scoreboard else {"name": "", "points": 0, "clientId": None}
+            second = scoreboard[1] if len(scoreboard) > 1 else {"name": "", "points": 0, "clientId": None}
+            third = scoreboard[2] if len(scoreboard) > 2 else {"name": "", "points": 0, "clientId": None}
+            broadcast(
+                {
+                    "type": "game_over",
+                    "winnerId": winner.get("clientId"),
+                    "winnerName": winner.get("name", ""),
+                    "winnerPoints": winner.get("points", 0),
+                    "secondId": second.get("clientId"),
+                    "secondName": second.get("name", ""),
+                    "secondPoints": second.get("points", 0),
+                    "thirdId": third.get("clientId"),
+                    "thirdName": third.get("name", ""),
+                    "thirdPoints": third.get("points", 0),
+                    "scoreboard": scoreboard,
+                }
+            )
+            log(f"Game over: winner={winner.get('name', '')} points={winner.get('points', 0)}", level="GAME")
+            log_blank()
 
         with state_lock:
             game_active = False
