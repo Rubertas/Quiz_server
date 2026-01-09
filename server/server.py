@@ -54,7 +54,7 @@ log(f"Local IP: {local_ip}")
 log(f"PORT: {PORT}")
 
 state_lock = threading.Lock()
-clients = {}  # conn -> {"id": int, "name": str, "gender": str, "score": int, "joined_at": float}
+clients = {}  # conn -> {"id": int, "name": str, "gender": str, "score": int, "streak": int, "joined_at": float}
 next_client_id = 1
 game_active = False
 current_qid = None
@@ -110,6 +110,7 @@ def start_game():
     with state_lock:
         for info in clients.values():
             info["score"] = 0
+            info["streak"] = 0
         answers = {}
         current_qid = None
         current_question = None
@@ -218,6 +219,7 @@ def game_loop():
                         choice, t_recv = answers_snapshot[client_id]
                         ok = ar_teisingas(q, choice)
                         points_awarded = 0
+                        streak_bonus = 0
                         if ok:
                             reaction_s = max(
                                 0.0,
@@ -228,6 +230,9 @@ def game_loop():
                             points_awarded = 20 + time_bonus
                             for info in clients.values():
                                 if info["id"] == client_id:
+                                    info["streak"] += 1
+                                    streak_bonus = min(40, (info["streak"] - 1) * 10)
+                                    points_awarded += streak_bonus
                                     info["score"] += points_awarded
                                     break
                         result = {
@@ -240,7 +245,13 @@ def game_loop():
                             "timeMs": int(t_recv * 1000),
                         }
                         if not ok:
+                            for info in clients.values():
+                                if info["id"] == client_id:
+                                    info["streak"] = 0
+                                    break
                             result["reason"] = "wrong"
+                        if ok and streak_bonus:
+                            result["streakBonus"] = streak_bonus
                         results.append(result)
                     else:
                         joined_at = None
@@ -259,6 +270,10 @@ def game_loop():
                                     "point": False,
                                 }
                             )
+                            for info in clients.values():
+                                if info["id"] == client_id:
+                                    info["streak"] = 0
+                                    break
                         else:
                             results.append(
                                 {
@@ -273,6 +288,7 @@ def game_loop():
                             for info in clients.values():
                                 if info["id"] == client_id:
                                     info["score"] -= 10
+                                    info["streak"] = 0
                                     break
 
             broadcast(
@@ -390,6 +406,7 @@ def handle_client(conn, addr):
                             "name": name,
                             "gender": gender,
                             "score": 0,
+                            "streak": 0,
                             "joined_at": time.time(),
                         }
                         next_client_id += 1
