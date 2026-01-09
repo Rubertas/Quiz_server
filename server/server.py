@@ -54,7 +54,7 @@ log(f"Local IP: {local_ip}")
 log(f"PORT: {PORT}")
 
 state_lock = threading.Lock()
-clients = {}  # conn -> {"id": int, "name": str, "score": int, "joined_at": float}
+clients = {}  # conn -> {"id": int, "name": str, "gender": str, "score": int, "joined_at": float}
 next_client_id = 1
 game_active = False
 current_qid = None
@@ -161,7 +161,8 @@ def game_loop():
                     break
 
             qid = q["klausimo_id"]
-            deadline = time.time() + ANSWER_WINDOW_S
+            question_start = time.time()
+            deadline = question_start + ANSWER_WINDOW_S
 
             with state_lock:
                 current_qid = qid
@@ -169,6 +170,7 @@ def game_loop():
                 current_round = round_idx + 1
                 round_deadline = deadline
                 answers = {}
+                expected_ids = {info["id"] for info in clients.values()}
 
             payload = klausimas_i_payload(
                 q,
@@ -185,8 +187,25 @@ def game_loop():
                 level="ROUND",
             )
 
-            while time.time() < deadline:
+            while True:
+                now = time.time()
+                if now >= deadline:
+                    break
+                with state_lock:
+                    active_expected = {
+                        info["id"]
+                        for info in clients.values()
+                        if info["id"] in expected_ids
+                    }
+                    if not active_expected:
+                        break
+                    if active_expected.issubset(answers.keys()):
+                        break
                 time.sleep(0.05)
+
+            round_end_time = min(deadline, time.time())
+            with state_lock:
+                round_deadline = round_end_time
 
             with state_lock:
                 answers_snapshot = dict(answers)
@@ -194,7 +213,6 @@ def game_loop():
 
             results = []
             with state_lock:
-                question_start = round_deadline - ANSWER_WINDOW_S
                 for client_id, name in players_snapshot.items():
                     if client_id in answers_snapshot:
                         choice, t_recv = answers_snapshot[client_id]
@@ -205,9 +223,9 @@ def game_loop():
                                 0.0,
                                 min(ANSWER_WINDOW_S, t_recv - question_start),
                             )
-                            time_bonus = int((1.0 - reaction_s / ANSWER_WINDOW_S) * 50)
-                            time_bonus = max(0, min(50, time_bonus))
-                            points_awarded = 50 + time_bonus
+                            time_bonus = int((1.0 - reaction_s / ANSWER_WINDOW_S) * 80)
+                            time_bonus = max(0, min(80, time_bonus))
+                            points_awarded = 20 + time_bonus
                             for info in clients.values():
                                 if info["id"] == client_id:
                                     info["score"] += points_awarded
@@ -311,6 +329,10 @@ def game_loop():
 def handle_client(conn, addr):
     log(f"Client connected: {addr}", level="NET")
     buffer = b""
+    rate_window_s = 1.0
+    rate_limit = 6
+    rate_window_start = time.time()
+    rate_count = 0
     while True:
         try:
             data = conn.recv(1024)
@@ -326,6 +348,15 @@ def handle_client(conn, addr):
                 except json.JSONDecodeError:
                     log("Invalid JSON from client", level="WARN")
                     continue
+                now = time.time()
+                if now - rate_window_start >= rate_window_s:
+                    rate_window_start = now
+                    rate_count = 0
+                rate_count += 1
+                if rate_count > rate_limit:
+                    send_json(conn, {"type": "error", "message": "rate_limited"})
+                    log(f"Rate limited client {addr}", level="WARN")
+                    continue
                 log(f"Received -> {msg_json}", level="IN")
 
                 msg_type = msg_json.get("type")
@@ -336,6 +367,18 @@ def handle_client(conn, addr):
                     if not name:
                         send_json(conn, {"type": "error", "message": "name_required"})
                         continue
+                    gender_raw = msg_json.get("gender") or msg_json.get("sex")
+                    gender = str(gender_raw or "").strip().lower()
+                    if not gender:
+                        send_json(conn, {"type": "error", "message": "gender_required"})
+                        continue
+                    if gender in ["m", "male", "vyras", "v"]:
+                        gender = "male"
+                    elif gender in ["f", "female", "moteris"]:
+                        gender = "female"
+                    else:
+                        send_json(conn, {"type": "error", "message": "bad_gender"})
+                        continue
                     global next_client_id
                     with state_lock:
                         if len(clients) >= MAX_NUM_OF_CLIENTS:
@@ -345,6 +388,7 @@ def handle_client(conn, addr):
                         clients[conn] = {
                             "id": next_client_id,
                             "name": name,
+                            "gender": gender,
                             "score": 0,
                             "joined_at": time.time(),
                         }
@@ -380,7 +424,6 @@ def handle_client(conn, addr):
                     log("Start ok sent", level="GAME")
 
                 elif msg_type == "answer":
-                    qid = msg_json.get("questionId")
                     choice = msg_json.get("choice") or var
                     if choice is None:
                         send_json(conn, {"type": "error", "message": "answer_missing"})
@@ -388,14 +431,6 @@ def handle_client(conn, addr):
                     choice = str(choice).strip().upper()
                     if choice not in ["A", "B", "C", "D"]:
                         send_json(conn, {"type": "error", "message": "bad_answer_format"})
-                        continue
-                    if qid is None:
-                        send_json(conn, {"type": "error", "message": "questionId_required"})
-                        continue
-                    try:
-                        qid_int = int(qid)
-                    except (TypeError, ValueError):
-                        send_json(conn, {"type": "error", "message": "bad_questionId"})
                         continue
                     now = time.time()
                     with state_lock:
@@ -405,9 +440,6 @@ def handle_client(conn, addr):
                         if current_qid is None:
                             send_json(conn, {"type": "answer_ack", "ok": False, "reason": "no_question"})
                             continue
-                        if qid_int != current_qid:
-                            send_json(conn, {"type": "answer_ack", "ok": False, "reason": "not_current_question"})
-                            continue
                         if now > round_deadline:
                             send_json(conn, {"type": "answer_ack", "ok": False, "reason": "too_late"})
                             continue
@@ -415,8 +447,10 @@ def handle_client(conn, addr):
                         if client_id is None:
                             send_json(conn, {"type": "answer_ack", "ok": False, "reason": "not_joined"})
                             continue
-                        if client_id not in answers:
-                            answers[client_id] = (choice, now)
+                        if client_id in answers:
+                            send_json(conn, {"type": "answer_ack", "ok": False, "reason": "already_answered"})
+                            continue
+                        answers[client_id] = (choice, now)
                     send_json(conn, {"type": "answer_ack", "ok": True})
                     log(f"Answer ack ok: choice={choice} clientId={client_id}", level="GAME")
 
