@@ -21,7 +21,7 @@ public class ClientInfo
 
 public static class Program
 {
-    private const string HOST = "192.168.4.1";
+    private const string HOST = "0.0.0.0";
     private const int PORT = 7777;
     private const int MAX_NUM_OF_CLIENTS = 10;
     private const int ANSWER_WINDOW_S = 30;
