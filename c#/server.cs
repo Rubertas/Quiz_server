@@ -639,13 +639,13 @@ public static class Program
 
                     if (msgType == "name")
                     {
-                        string name = (var ?? "").Trim();
+                        string name = (var ?? GetString(msgJson, "name") ?? GetString(msgJson, "playerName") ?? "").Trim();
                         if (string.IsNullOrEmpty(name))
                         {
                             SendJson(conn, new Dictionary<string, object> { ["type"] = "error", ["message"] = "name_required" });
                             continue;
                         }
-                        string genderRaw = GetString(msgJson, "gender") ?? GetString(msgJson, "sex");
+                        string genderRaw = GetString(msgJson, "gender") ?? GetString(msgJson, "sex") ?? GetString(msgJson, "playerGender");
                         string gender = (genderRaw ?? "").Trim().ToLowerInvariant();
                         if (string.IsNullOrEmpty(gender))
                         {
@@ -730,7 +730,7 @@ public static class Program
                     }
                     else if (msgType == "answer")
                     {
-                        string choice = GetString(msgJson, "choice") ?? var;
+                        string choice = GetString(msgJson, "choice") ?? GetString(msgJson, "answer") ?? var;
                         if (choice == null)
                         {
                             SendJson(conn, new Dictionary<string, object> { ["type"] = "error", ["message"] = "answer_missing" });
